@@ -1,0 +1,6 @@
+flask
+demucs
+torch
+torchaudio
+boto3
+gunicorn
