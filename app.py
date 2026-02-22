@@ -29,11 +29,11 @@ logging.info(f"Output directory: {OUTPUT_DIR}")
 
  # Optional S3 configuration
 S3_BUCKET = os.environ.get("S3_BUCKET")
-S3_PRESIGN_EXP = int(os.environ.get("S3_PRESIGN_EXP", 3600))  # default 1 hour
+S3_PRESIGN_EXP = int(os.environ.get("S3_PRESIGN_EXP", 86400))  # default 1 day
 S3_ENDPOINT = os.environ.get("S3_ENDPOINT")
 S3_REGION = os.environ.get("S3_REGION")
 
-def upload_file_to_s3(file_path: str, bucket: str, key: str, expire: int = 3600) -> str:
+def upload_file_to_s3(file_path: str, bucket: str, key: str, expire: int = S3_PRESIGN_EXP) -> str:
     """Upload a file to S3 and return a presigned GET URL on success.
     Raises exception on failure.
     """
@@ -128,7 +128,7 @@ def separate_audio():
             input_path = os.path.join(tmpdir, filename)
             audio_file.save(input_path)
             logging.info(f"Saved uploaded file to {input_path}")
-
+            
             # Load the audio
             try:
                 wav = load_track(input_path, model.audio_channels, model.samplerate)
@@ -579,7 +579,6 @@ def process_separate_queue():
                 threading.Timer(0, process_separate_queue).start()
         threading.Thread(target=worker, args=(job,)).start()
 
-
 # RunPod handler for /api/separate/async
 def runpod_separate_async_handler(event):
     # event['input'] should contain the file data and metadata
@@ -587,13 +586,17 @@ def runpod_separate_async_handler(event):
     file_data = event['input'].get('audio') or event['input'].get('file')
     if not file_data:
         return {'error': 'No file uploaded'}
+       
+@app.route('/api/separate/async', methods=['POST'])
+def api_separate_async():
+    if 'audio' not in request.files:
+        return jsonify({'error': 'No file uploaded'}), 400
     if len(separate_queue) >= SEPARATE_MAX_QUEUE:
-        return {'error': 'Server busy. Try again later'}
-    # Save file to disk
+        return jsonify({'error': 'Server busy. Try again later'}), 429
+    audio_file = request.files['audio']
     job_id = str(uuid.uuid4())
     input_path = os.path.join(UPLOAD_FOLDER, f"{job_id}.wav")
-    with open(input_path, 'wb') as f:
-        f.write(file_data)
+    audio_file.save(input_path)
     job = {
         'id': job_id,
         'status': 'queued',
@@ -601,12 +604,11 @@ def runpod_separate_async_handler(event):
         'createdAt': time.time(),
         'result': None,
         'error': None,
-        'baseUrlFromReq': event.get('baseUrlFromReq', '')
+        'baseUrlFromReq': f"{request.scheme}://{request.host}"
     }
     separate_jobs[job_id] = job
     separate_queue.append(job)
     process_separate_queue()
-    # Only return job info, not result
     return {'success': True, 'job_id': job_id, 'status': 'queued'}
 
 # Register handler with RunPod (handle mode for LB API)
@@ -614,17 +616,11 @@ runpod.serverless.handle(runpod_separate_async_handler)
 
 @app.route('/api/separate', methods=['POST'])
 def api_separate():
-    # Accept both 'audio' and 'file' as upload field
-    file_field = None
-    if 'audio' in request.files:
-        file_field = 'audio'
-    elif 'file' in request.files:
-        file_field = 'file'
-    if not file_field:
+    if 'audio' not in request.files:
         return jsonify({'error': 'No file uploaded'}), 400
     if len(separate_queue) >= SEPARATE_MAX_QUEUE:
         return jsonify({'error': 'Server busy. Try again later'}), 429
-    audio_file = request.files[file_field]
+    audio_file = request.files['audio']
     async_mode = request.args.get('async') == 'true' or request.form.get('async') == 'true'
     job_id = str(uuid.uuid4())
     input_path = os.path.join(UPLOAD_FOLDER, f"{job_id}.wav")
@@ -722,38 +718,23 @@ def api_merge_drums():
             logging.info(f"Downloaded and saved {name} to {temp_path}")
         output_filename = f"{int(time.time())}-{uuid.uuid4().hex}.mp3"
         output_path = os.path.join(UPLOAD_FOLDER, output_filename)
-        if len(temp_paths) == 1:
-            shutil.copyfile(temp_paths[0], output_path)
-            logging.info(f"Copied single file to {output_path}")
-        else:
-            ffmpeg_bin = shutil.which('ffmpeg') or '/usr/bin/ffmpeg'
-            args = []
+        ffmpeg_bin = shutil.which('ffmpeg') or '/usr/bin/ffmpeg'
+        args = []
+        for p in temp_paths:
+            args += ['-i', p]
+        filter = ''.join([f'[{i}:a]' for i in range(len(temp_paths))]) + f"amix=inputs={len(temp_paths)}:duration=longest:dropout_transition=2[out]"
+        args += ['-filter_complex', filter, '-map', '[out]', '-b:a', '192k', output_path]
+        proc = subprocess.run([ffmpeg_bin] + args, capture_output=True)
+        if proc.returncode != 0 or not os.path.exists(output_path):
+            logging.error(f"FFmpeg mixing error, return code: {proc.returncode}")
             for p in temp_paths:
-                args += ['-i', p]
-            filter = ''.join([f'[{i}:a]' for i in range(len(temp_paths))]) + f"amix=inputs={len(temp_paths)}:duration=longest:dropout_transition=2[out]"
-            args += ['-filter_complex', filter, '-map', '[out]', '-b:a', '192k', output_path]
-            proc = subprocess.run([ffmpeg_bin] + args, capture_output=True)
-            if proc.returncode != 0 or not os.path.exists(output_path):
-                logging.error(f"FFmpeg mixing error, return code: {proc.returncode}, output_path exists: {os.path.exists(output_path)}")
-                for p in temp_paths:
-                    safe_delete(p)
-                safe_delete(output_path)
-                return jsonify({'success': False, 'error': 'Mixing error'}), 500
-            logging.info(f"FFmpeg mixing succeeded, output at {output_path}")
+                safe_delete(p)
+            safe_delete(output_path)
+            return jsonify({'success': False, 'error': 'Mixing error'}), 500
+        logging.info(f"FFmpeg mixing succeeded, output at {output_path}")
         for p in temp_paths:
             safe_delete(p)
-            logging.info(f"Deleted temp file {p}")
-            file_url = None
-            if S3_BUCKET:
-                s3_key = output_filename
-                try:
-                    file_url = upload_file_to_s3(output_path, S3_BUCKET, s3_key)
-                logging.info(f"S3 upload succeeded for {output_filename}, url: {file_url}")
-                except Exception as e:
-                    logging.error(f"S3 upload failed for {output_filename}, falling back to local URL: {e}")
-            if not file_url:
-                file_url = f"{request.host_url.rstrip('/')}/uploads/{output_filename}"
-        logging.info(f"Final mp3_url: {file_url}")
+        file_url = f"{request.host_url.rstrip('/')}/uploads/{output_filename}"
         return jsonify({'success': True, 'mp3_url': file_url})
     except Exception as error:
         logging.exception(f"Exception in /api/merge_drums: {error}")

@@ -13,6 +13,9 @@ WORKDIR /app
 COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir $(grep -vE '^(torch|torchaudio)' /app/requirements.txt | tr '\n' ' ')
 
+# Ensure runpod is installed (in case requirements.txt is not picked up)
+RUN pip install --no-cache-dir runpod
+
 # Copy application
 COPY . /app
 

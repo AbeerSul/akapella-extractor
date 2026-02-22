@@ -4,3 +4,4 @@ torch
 torchaudio
 boto3
 gunicorn
+runpod

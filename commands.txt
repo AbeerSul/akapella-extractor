@@ -1,0 +1,13 @@
+ssh abeer@68.178.167.175
+POST http://68.178.167.175:3000/api/upload
+lsof -i :3000
+kill -9 70685
+-------
+docker build --no-cache --pull -t docker.io/abeersul/demucs-serverless:latest -f dockerfile .
+docker build --no-cache --pull -t docker.io/abeersul/demucs-serverless:gpu -f Dockerfile.gpu .
+docker build  -t abeersul/demucs-serverless:latest -f dockerfile .
+docker build -t demucs-serverless:latest -f dockerfile .
+docker push docker.io/abeersul/demucs-serverless:latest
+docker.io/abeersul/demucs-serverless:latest
+akapella-ai-separate
+
